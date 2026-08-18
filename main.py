@@ -4,6 +4,7 @@ import httpx
 import re
 import random
 import string
+from typing import Optional
 
 app = FastAPI()
 
@@ -27,66 +28,90 @@ def generate_whatsapp_message(phone):
         f"# Kode WhatsApp {code} Jangan bagikan kode ini dengan orang lain {suffix}",
         f"# Codigo de WhatsApp Business {code} No compartas este codigo con nadie {suffix}",
         f"<#> Your WhatsApp account is being registered on a new device\n\nDo not share this code with anyone\nYour WhatsApp code: {code}\n{suffix}",
-        f"Your WhatsApp Business code {code}\nDont share this code with others"
+        f"Your WhatsApp Business code {code}\nDont share this code with others",
+        f"كود واتساب للأعمال الخاص بك ‎{code.replace('-', '')}\nلا تشاركه مع أحد"
     ]
     
     return random.choice(messages)
 
 @app.get("/")
-async def root(token: str = Query(...)):
+async def root(token: Optional[str] = Query(None)):
+    # Check if token is provided
+    if not token:
+        return {
+            "error": "Missing token parameter",
+            "message": "Please provide a token: ?token=YOUR_TOKEN_HERE",
+            "example": "https://your-app.railway.app/?token=your_token_here"
+        }
+    
     try:
-        # Try different URL formats
-        urls = [
-            f"{API_URL}?token={token}",
-            f"{API_URL}?key={token}",
-            f"{API_URL}/{token}",
-            f"http://147.135.212.197/crapi/st/viewstats.php?token={token}",
-            f"http://147.135.212.197/crapi/st/viewstats/?token={token}"
-        ]
-        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = None
-            for url in urls:
-                try:
-                    response = await client.get(url)
-                    if response.status_code == 200:
-                        break
-                except:
-                    continue
+            response = await client.get(f"{API_URL}?token={token}")
             
-            if not response or response.status_code != 200:
-                return {"error": "Failed to fetch data", "status_code": response.status_code if response else "No response"}
+            # Check response status
+            if response.status_code != 200:
+                return {
+                    "error": f"API returned status {response.status_code}",
+                    "message": "The token might be invalid or expired",
+                    "response": response.text
+                }
             
             data = response.json()
             
-            # Check if response is ["s","t","a","t"] - meaning invalid token
+            # Check for invalid responses
             if data == ["s", "t", "a", "t"]:
                 return {
-                    "error": "Invalid token or API endpoint",
-                    "message": "The token provided is not valid",
-                    "hint": "Check your token and try again"
+                    "error": "Invalid token",
+                    "message": "The token provided is not valid or has expired",
+                    "hint": "Please check your token and try again"
                 }
             
-            # Process the data
-            processed_data = []
-            for item in data:
-                if isinstance(item, list) and len(item) >= 4:
-                    service = item[0]
-                    phone = item[1]
-                    message = item[2]
-                    timestamp = item[3]
-                    
-                    if service == "WhatsApp" and message == "*******":
-                        new_message = generate_whatsapp_message(phone)
-                        processed_data.append([service, phone, new_message, timestamp])
-                    else:
-                        processed_data.append([service, phone, message, timestamp])
-                else:
-                    processed_data.append(item)
+            if data == ["status", "msg"]:
+                return {
+                    "error": "API requires valid token",
+                    "message": "The token might be missing or incorrect",
+                    "hint": "Make sure to use: ?token=YOUR_TOKEN_HERE"
+                }
             
-            return processed_data
+            # If data is a list, process it
+            if isinstance(data, list):
+                processed_data = []
+                for item in data:
+                    if isinstance(item, list) and len(item) >= 4:
+                        service = item[0]
+                        phone = item[1]
+                        message = item[2]
+                        timestamp = item[3]
+                        
+                        # Replace WhatsApp ******* with realistic messages
+                        if service == "WhatsApp" and message == "*******":
+                            new_message = generate_whatsapp_message(phone)
+                            processed_data.append([service, phone, new_message, timestamp])
+                        else:
+                            processed_data.append([service, phone, message, timestamp])
+                    else:
+                        processed_data.append(item)
+                
+                return processed_data
+            else:
+                # If data is not a list, return as-is
+                return {
+                    "original_response": data,
+                    "note": "Response format is not the expected list format"
+                }
             
     except httpx.TimeoutException:
-        return {"error": "Request timeout - API might be slow or unreachable"}
+        return {"error": "Request timeout - API is slow or unreachable"}
+    except httpx.ConnectError:
+        return {"error": "Cannot connect to API - server might be down"}
     except Exception as e:
-        return {"error": str(e), "message": "Check if the API URL and token are correct"}
+        return {"error": str(e)}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "message": "API is running"}
+
+# For development
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
