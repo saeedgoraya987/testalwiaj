@@ -1,24 +1,35 @@
 # main.py
 from fastapi import FastAPI, Query
 import httpx
-import random
-import string
+import hashlib
 from typing import Optional
 
 app = FastAPI()
 
 API_URL = "http://147.135.212.197/crapi/st/viewstats"
 
-def generate_whatsapp_code():
-    return f"{random.randint(100, 999)}-{random.randint(100, 999)}"
-
-def generate_random_suffix():
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choices(chars, k=10))
-
-def generate_whatsapp_message():
-    code = generate_whatsapp_code()
-    suffix = generate_random_suffix()
+def generate_consistent_whatsapp_message(phone, original_message):
+    """
+    Generate consistent WhatsApp messages based on phone number
+    Same phone number always gets the same message
+    """
+    # Use phone number to generate consistent codes
+    hash_obj = hashlib.md5(phone.encode())
+    hash_hex = hash_obj.hexdigest()
+    
+    # Generate consistent 6-digit code
+    code_int = int(hash_hex[:8], 16) % 900 + 100
+    code = f"{code_int}-{code_int + 100}"
+    
+    # Generate consistent suffix (10 chars)
+    suffix_chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    suffix = ''
+    for i in range(10):
+        idx = int(hash_hex[i:i+2], 16) % len(suffix_chars)
+        suffix += suffix_chars[idx]
+    
+    # Use phone number to deterministically pick a template
+    template_index = int(hash_hex[:4], 16) % 9
     
     messages = [
         f"# Your WhatsApp code {code} Dont share this code with others {suffix}",
@@ -32,7 +43,7 @@ def generate_whatsapp_message():
         f"كود واتساب للأعمال الخاص بك ‎{code.replace('-', '')}\nلا تشاركه مع أحد"
     ]
     
-    return random.choice(messages)
+    return messages[template_index]
 
 @app.get("/")
 async def root(token: Optional[str] = Query(None)):
@@ -55,9 +66,9 @@ async def root(token: Optional[str] = Query(None)):
                         message = item[2]
                         timestamp = item[3]
                         
-                        # Replace WhatsApp ******* with realistic messages
+                        # Replace WhatsApp ******* with consistent messages
                         if service == "WhatsApp" and message == "*******":
-                            new_message = generate_whatsapp_message()
+                            new_message = generate_consistent_whatsapp_message(phone, message)
                             processed_data.append([service, phone, new_message, timestamp])
                         else:
                             processed_data.append([service, phone, message, timestamp])
@@ -70,7 +81,6 @@ async def root(token: Optional[str] = Query(None)):
                 return data
             
     except Exception as e:
-        # Only return error if there's a connection issue
         return {
             "status": "error",
             "msg": str(e)
