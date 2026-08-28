@@ -252,33 +252,43 @@ def fetch_sms():
 
 
 # ============================================
-# PARSE SMS - PROPER CSV PARSING
+# PARSE SMS - PROPER CSV WITH MULTI-LINE SUPPORT
 # ============================================
 def parse_sms(data):
-    """Parse CSV data and return list of SMS messages in simple array format [CLI, Number, SMS, Date]"""
+    """Parse CSV data with multi-line SMS messages"""
     if not data:
         return []
 
     new_records = []
     
     try:
-        # Parse CSV with proper quoting
-        csv_reader = csv.reader(StringIO(data))
+        # Use csv reader with proper settings for multi-line
+        csv_reader = csv.reader(StringIO(data), quotechar='"', delimiter=',', 
+                               quoting=csv.QUOTE_ALL, skipinitialspace=True)
         
-        # Skip header
-        next(csv_reader, None)
+        # Get header
+        try:
+            header = next(csv_reader)
+            print(f"📋 CSV Header: {header}")
+        except StopIteration:
+            print("❌ Empty CSV data")
+            return []
         
+        # Process each row
+        row_count = 0
         for row in csv_reader:
+            row_count += 1
+            print(f"📝 Processing row {row_count}: {len(row)} columns")
+            
             if len(row) >= 9:
-                # Columns based on CSV structure:
-                # 0: Date, 1: Range, 2: Number, 3: CLI, 4: Client, 5: SMS, 6: Currency, 7: My Payout, 8: Client Payout
+                # Columns: Date, Range, Number, CLI, Client, SMS, Currency, My Payout, Client Payout
                 date = row[0].strip()
                 cli = row[3].strip()  # CLI (Sender)
                 number = row[2].strip()  # Number
-                sms = row[5].strip()  # SMS (may contain newlines)
+                sms = row[5].strip()  # SMS
                 
-                # Clean up the SMS text - remove extra quotes if present
-                sms = sms.strip('"')
+                # Clean up the SMS text
+                sms = sms.replace('\r\n', '\n').replace('\r', '\n')
                 
                 # Create record in the format: [CLI, Number, SMS, Date]
                 record = [cli, number, sms, date]
@@ -291,69 +301,104 @@ def parse_sms(data):
                         seen_sms.add(sms_id)
                         sms_storage.append(record)
                         new_records.append(record)
+                        print(f"✅ Added new SMS from {cli} at {date}")
+        
+        print(f"📊 Processed {row_count} total rows, added {len(new_records)} new records")
                         
     except Exception as e:
         print(f"❌ Error parsing CSV: {e}")
-        # Fallback to manual parsing if CSV parser fails
+        import traceback
+        traceback.print_exc()
+        # Fallback to manual parsing
         return parse_sms_manual(data)
     
     return new_records
 
 
 # ============================================
-# PARSE SMS - MANUAL FALLBACK
+# PARSE SMS - MANUAL FALLBACK FOR MULTI-LINE
 # ============================================
 def parse_sms_manual(data):
-    """Fallback manual parsing if CSV parser fails"""
+    """Manual parsing for multi-line CSV records"""
     if not data:
-        return []
-
-    lines = data.splitlines()
-    if not lines:
         return []
 
     new_records = []
     
-    # Skip header
-    start_index = 0
+    # Split by lines but handle quoted multi-line fields
+    lines = data.split('\n')
+    
+    # Find header
+    header_index = -1
     for i, line in enumerate(lines):
         if line.strip().startswith('"Date"') or line.strip().startswith('Date'):
-            start_index = i + 1
+            header_index = i
             break
     
-    for i in range(start_index, len(lines)):
+    if header_index == -1:
+        print("❌ No header found")
+        return []
+    
+    # Process rows, handling multi-line records
+    i = header_index + 1
+    row_count = 0
+    
+    while i < len(lines):
         line = lines[i].strip()
         if not line:
+            i += 1
             continue
         
-        # Simple split by comma (works for basic cases)
-        parts = line.split(',')
-        if len(parts) >= 6:
-            # Remove quotes
-            date = parts[0].strip('"')
-            cli = parts[3].strip('"') if len(parts) > 3 else ""
-            number = parts[2].strip('"') if len(parts) > 2 else ""
+        # Check if this starts a new record (starts with date)
+        if re.match(r'^"\d{4}-\d{2}-\d{2}', line) or re.match(r'^\d{4}-\d{2}-\d{2}', line):
+            # Build the complete record by combining lines until we have 9 fields
+            record_lines = [line]
+            j = i + 1
+            combined = line
             
-            # Get SMS (might contain commas)
-            sms_parts = []
-            for j in range(5, len(parts)):
-                part = parts[j].strip('"')
-                if part and not part.startswith('$') and not part.replace('.', '').isdigit():
-                    sms_parts.append(part)
-                else:
-                    break
-            sms = ' '.join(sms_parts)
+            # Count fields in current combined string
+            field_count = combined.count('"') // 2
+            while j < len(lines) and field_count < 9:
+                next_line = lines[j].strip()
+                if next_line:
+                    combined += '\n' + next_line
+                    record_lines.append(next_line)
+                    field_count = combined.count('"') // 2
+                j += 1
             
-            if sms:
-                record = [cli, number, sms, date]
-                sms_id = f"{date}_{cli}_{number}_{sms[:20]}"
-                
-                with sms_lock:
-                    if sms_id not in seen_sms:
-                        seen_sms.add(sms_id)
-                        sms_storage.append(record)
-                        new_records.append(record)
+            # Now parse this combined record
+            try:
+                # Use csv reader on this single record
+                csv_reader = csv.reader(StringIO(combined), quotechar='"', delimiter=',')
+                for row in csv_reader:
+                    if len(row) >= 9:
+                        date = row[0].strip()
+                        cli = row[3].strip()
+                        number = row[2].strip()
+                        sms = row[5].strip()
+                        
+                        # Clean up SMS
+                        sms = sms.replace('\r\n', '\n').replace('\r', '\n')
+                        
+                        record = [cli, number, sms, date]
+                        sms_id = f"{date}_{cli}_{number}_{sms[:20]}"
+                        
+                        with sms_lock:
+                            if sms_id not in seen_sms:
+                                seen_sms.add(sms_id)
+                                sms_storage.append(record)
+                                new_records.append(record)
+                                print(f"✅ Added new SMS from {cli} at {date}")
+                        
+                        row_count += 1
+            except Exception as e:
+                print(f"⚠️ Error parsing record: {e}")
+            
+            i = j
+        else:
+            i += 1
     
+    print(f"📊 Manually processed {row_count} rows, added {len(new_records)} new records")
     return new_records
 
 
@@ -373,14 +418,19 @@ def monitor_sms():
         try:
             data = fetch_sms()
             if data:
+                print(f"📥 Received {len(data)} bytes of data")
                 new_records = parse_sms(data)
                 if new_records:
-                    print(f"📩 Received {len(new_records)} new SMS messages")
+                    print(f"📩 Added {len(new_records)} new SMS messages")
                     save_data()
+                else:
+                    print("ℹ️ No new SMS messages found")
             else:
-                print(f"⏳ {datetime.now().strftime('%H:%M:%S')} - No new SMS")
+                print(f"⏳ {datetime.now().strftime('%H:%M:%S')} - No data received")
         except Exception as e:
             print(f"❌ Monitor error: {e}")
+            import traceback
+            traceback.print_exc()
         
         time.sleep(30)  # Check every 30 seconds
 
