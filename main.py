@@ -1,9 +1,14 @@
+from flask import Flask, jsonify, request
 import requests
 import re
 import time
 import os
 from datetime import datetime, timedelta
 import json
+import threading
+from collections import deque
+
+app = Flask(__name__)
 
 # ============================================
 # CREDENTIALS - Use environment variables
@@ -20,20 +25,22 @@ USER_AGENT = (
 
 session = requests.Session()
 
-# Already printed records
+# Store for SMS messages
+sms_storage = deque(maxlen=1000)  # Store last 1000 messages
 seen_sms = set()
+sms_lock = threading.Lock()
 
-# For Railway, we'll use a simple file-based storage for seen_sms
-# to persist across restarts
+# For Railway, we'll use a simple file-based storage
 SEEN_FILE = "seen_sms.json"
+STORAGE_FILE = "sms_storage.json"
 
 
 # ============================================
-# PERSIST SEEN SMS
+# PERSISTENT STORAGE
 # ============================================
-def load_seen_sms():
-    """Load seen SMS from file"""
-    global seen_sms
+def load_data():
+    """Load seen SMS and storage from files"""
+    global seen_sms, sms_storage
     try:
         if os.path.exists(SEEN_FILE):
             with open(SEEN_FILE, 'r') as f:
@@ -42,15 +49,27 @@ def load_seen_sms():
     except Exception as e:
         print(f"⚠️ Could not load seen SMS: {e}")
         seen_sms = set()
+    
+    try:
+        if os.path.exists(STORAGE_FILE):
+            with open(STORAGE_FILE, 'r') as f:
+                stored = json.load(f)
+                sms_storage = deque(stored, maxlen=1000)
+            print(f"📂 Loaded {len(sms_storage)} stored SMS messages")
+    except Exception as e:
+        print(f"⚠️ Could not load SMS storage: {e}")
+        sms_storage = deque(maxlen=1000)
 
 
-def save_seen_sms():
-    """Save seen SMS to file"""
+def save_data():
+    """Save seen SMS and storage to files"""
     try:
         with open(SEEN_FILE, 'w') as f:
             json.dump(list(seen_sms), f)
+        with open(STORAGE_FILE, 'w') as f:
+            json.dump(list(sms_storage), f)
     except Exception as e:
-        print(f"⚠️ Could not save seen SMS: {e}")
+        print(f"⚠️ Could not save data: {e}")
 
 
 # ============================================
@@ -62,9 +81,7 @@ def login():
     try:
         response = session.get(
             f"{BASE_URL}/login",
-            headers={
-                "User-Agent": USER_AGENT
-            },
+            headers={"User-Agent": USER_AGENT},
             timeout=20
         )
 
@@ -81,10 +98,7 @@ def login():
         num2 = int(captcha_match.group(2))
         captcha_answer = num1 + num2
 
-        print(
-            f"🧩 Captcha: "
-            f"{num1} + {num2} = {captcha_answer}"
-        )
+        print(f"🧩 Captcha: {num1} + {num2} = {captcha_answer}")
 
         login_response = session.post(
             f"{BASE_URL}/signin",
@@ -118,16 +132,13 @@ def login():
 # SESSION CHECK
 # ============================================
 def session_is_valid():
-
     if "x12" not in session.cookies:
         return False
 
     try:
         response = session.get(
             f"{BASE_URL}/agent/SMSCDRReports",
-            headers={
-                "User-Agent": USER_AGENT
-            },
+            headers={"User-Agent": USER_AGENT},
             timeout=20,
             allow_redirects=True
         )
@@ -135,10 +146,7 @@ def session_is_valid():
         if "/login" in response.url.lower():
             return False
 
-        if (
-            "signin" in response.text.lower()
-            and "username" in response.text.lower()
-        ):
+        if "signin" in response.text.lower() and "username" in response.text.lower():
             return False
 
         return response.status_code == 200
@@ -151,7 +159,6 @@ def session_is_valid():
 # ENSURE LOGIN
 # ============================================
 def ensure_login():
-
     if session_is_valid():
         return True
 
@@ -161,15 +168,9 @@ def ensure_login():
     session.cookies.clear()
 
     for attempt in range(1, 4):
-
         if login():
             return True
-
-        print(
-            f"❌ Login attempt "
-            f"{attempt}/3 failed"
-        )
-
+        print(f"❌ Login attempt {attempt}/3 failed")
         if attempt < 3:
             time.sleep(5)
 
@@ -177,21 +178,16 @@ def ensure_login():
 
 
 # ============================================
-# FETCH CSV
+# FETCH SMS
 # ============================================
 def fetch_sms():
-
     if not ensure_login():
         return None
 
     start_date = datetime.now().strftime("%Y-%m-%d")
-
-    end_date = (
-        datetime.now() + timedelta(days=1)
-    ).strftime("%Y-%m-%d")
+    end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
 
     try:
-
         response = session.post(
             f"{BASE_URL}/agent/res/exportsmscdr",
             data={
@@ -204,37 +200,25 @@ def fetch_sms():
             },
             headers={
                 "X-Requested-With": "XMLHttpRequest",
-                "Content-Type":
-                    "application/x-www-form-urlencoded",
-                "Referer":
-                    f"{BASE_URL}/agent/SMSCDRReports",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": f"{BASE_URL}/agent/SMSCDRReports",
                 "User-Agent": USER_AGENT
             },
             timeout=20
         )
 
-        # ========================================
-        # SESSION EXPIRED
-        # ========================================
+        # Check for session expiration
         if (
             response.status_code in (401, 403)
             or "/login" in response.url.lower()
-            or (
-                "signin" in response.text.lower()
-                and "username" in response.text.lower()
-            )
+            or ("signin" in response.text.lower() and "username" in response.text.lower())
         ):
-
-            print("⚠️ Session expired")
-            print("🔄 Re-logging in...")
-
+            print("⚠️ Session expired, re-logging...")
             session.cookies.clear()
-
             if not login():
                 return None
-
-            print("🔁 Retrying SMS request...")
-
+            
+            # Retry request
             response = session.post(
                 f"{BASE_URL}/agent/res/exportsmscdr",
                 data={
@@ -246,28 +230,18 @@ def fetch_sms():
                     "fcli": ""
                 },
                 headers={
-                    "X-Requested-With":
-                        "XMLHttpRequest",
-                    "Content-Type":
-                        "application/x-www-form-urlencoded",
-                    "Referer":
-                        f"{BASE_URL}/agent/SMSCDRReports",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": f"{BASE_URL}/agent/SMSCDRReports",
                     "User-Agent": USER_AGENT
                 },
                 timeout=20
             )
 
-        if (
-            response.status_code == 200
-            and "html" not in response.text.lower()
-        ):
+        if response.status_code == 200 and "html" not in response.text.lower():
             return response.text
 
-        print(
-            f"❌ Request failed: "
-            f"{response.status_code}"
-        )
-
+        print(f"❌ Request failed: {response.status_code}")
         return None
 
     except requests.RequestException as e:
@@ -276,138 +250,246 @@ def fetch_sms():
 
 
 # ============================================
-# PARSE AND PRINT SMS IN REQUIRED FORMAT
+# PARSE SMS
 # ============================================
-def parse_and_print_sms(data):
-    """
-    Parse CSV data and print SMS in the format:
-    [
-      ["Google", "22220197732", "G-540150 est votre code de validation Google", "2026-08-28 03:35:17"]
-    ]
-    """
+def parse_sms(data):
+    """Parse CSV data and return list of SMS messages"""
     if not data:
-        return
+        return []
 
     lines = data.splitlines()
     if not lines:
-        return
+        return []
 
-    # Track new SMS records
     new_records = []
 
     for line in lines:
-        # Skip empty lines
         if not line.strip():
             continue
 
-        # Check if this is a valid CSV line with timestamp
         if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},", line):
-            # Parse the CSV line
             parts = line.split(',')
             
-            # We expect at least 4 columns
-            if len(parts) >= 4:
-                # Extract data
-                # Column order might vary, but typically:
-                # timestamp, sender, number, message, etc.
+            if len(parts) >= 6:
                 timestamp = parts[0].strip()
+                phone_number = parts[2].strip() if len(parts) > 2 else ""
+                sender = parts[3].strip() if len(parts) > 3 else ""
                 
-                # Try to find sender (could be in different positions)
-                # Based on your format, sender might be in column 1 or 2
-                sender = ""
+                # Build message from columns 4 and 5
                 message = ""
-                number = ""
+                if len(parts) > 4:
+                    message = parts[4].strip()
+                if len(parts) > 5 and parts[5].strip():
+                    if message:
+                        message += " " + parts[5].strip()
+                    else:
+                        message = parts[5].strip()
                 
-                # This is a simplified parsing - adjust based on actual CSV structure
-                for i, part in enumerate(parts):
-                    part = part.strip()
-                    # Look for sender
-                    if not sender and part and not part.startswith('+') and not re.match(r'^\d{4}-\d{2}-\d{2}', part):
-                        sender = part
-                    # Look for message
-                    if not message and part and len(part) > 10 and not part.startswith('+'):
-                        message = part
-                    # Look for number
-                    if not number and part and part.startswith('+'):
-                        number = part
-                    # If we have sender, number, and message, break
-                    if sender and number and message:
-                        break
+                # Create record in the format: [sender, phone_number, message, timestamp]
+                record = [sender, phone_number, message, timestamp]
                 
-                # If we didn't find them, use fallback positions
-                if not sender and len(parts) > 1:
-                    sender = parts[1].strip() if parts[1].strip() else "Unknown"
-                if not number and len(parts) > 2:
-                    # Try to find a number format
-                    for part in parts[2:]:
-                        if re.search(r'\+?\d{8,15}', part):
-                            number = part.strip()
-                            break
-                    if not number:
-                        number = parts[2].strip() if len(parts) > 2 else ""
-                if not message and len(parts) > 3:
-                    message = parts[3].strip() if len(parts) > 3 else ""
+                # Create unique identifier
+                sms_id = f"{timestamp}_{sender}_{phone_number}_{message[:20]}"
                 
-                # Create record in the format: [sender, number, message, timestamp]
-                # Your format: ["Google", "22220197732", "G-540150 est votre code de validation Google", "2026-08-28 03:35:17"]
-                record = [sender, number, message, timestamp]
-                
-                # Create a unique identifier for this SMS
-                sms_id = f"{timestamp}_{sender}_{number}_{message[:20]}"
-                
-                # Check if we've seen this SMS before
-                if sms_id not in seen_sms:
-                    seen_sms.add(sms_id)
-                    new_records.append(record)
-                    
-                    # Print in the required format
-                    print("\n📩 NEW SMS:")
-                    print(json.dumps([record], indent=2, ensure_ascii=False))
-                    
-                    # Save seen SMS periodically
-                    save_seen_sms()
+                with sms_lock:
+                    if sms_id not in seen_sms:
+                        seen_sms.add(sms_id)
+                        sms_storage.append(record)
+                        new_records.append(record)
 
     return new_records
 
 
 # ============================================
-# MAIN
+# BACKGROUND SMS MONITOR
 # ============================================
-def main():
-    # Load previously seen SMS
-    load_seen_sms()
+def monitor_sms():
+    """Background thread to continuously fetch SMS"""
+    print("🔄 SMS monitor thread started")
     
     # Initial login
     if not login():
         print("❌ Initial login failed")
         return
 
-    print("🚀 SMS monitor started")
-    print(f"📊 Monitoring on Railway - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("⏱️ Checking every 30 seconds\n")
+    while True:
+        try:
+            data = fetch_sms()
+            if data:
+                new_records = parse_sms(data)
+                if new_records:
+                    print(f"📩 Received {len(new_records)} new SMS messages")
+                    save_data()
+            else:
+                print(f"⏳ {datetime.now().strftime('%H:%M:%S')} - No new SMS")
+        except Exception as e:
+            print(f"❌ Monitor error: {e}")
+        
+        time.sleep(30)  # Check every 30 seconds
 
-    # For Railway, we should handle graceful shutdown
+
+# ============================================
+# FLASK API ROUTES
+# ============================================
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home endpoint"""
+    return jsonify({
+        "service": "SMS Monitor API",
+        "status": "running",
+        "version": "1.0.0",
+        "endpoints": [
+            "/api/sms - GET all SMS messages",
+            "/api/sms/latest - GET latest SMS messages",
+            "/api/sms/search?q=keyword - Search SMS",
+            "/api/sms/count - Get total count",
+            "/health - Health check"
+        ]
+    })
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint for Railway"""
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "sms_count": len(sms_storage),
+        "seen_count": len(seen_sms)
+    })
+
+
+@app.route('/api/sms', methods=['GET'])
+def get_all_sms():
+    """Get all SMS messages"""
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    
+    with sms_lock:
+        sms_list = list(sms_storage)
+        # Reverse to show newest first
+        sms_list.reverse()
+        
+        # Apply pagination
+        paginated = sms_list[offset:offset+limit]
+        
+        return jsonify({
+            "status": "success",
+            "count": len(paginated),
+            "total": len(sms_list),
+            "data": paginated
+        })
+
+
+@app.route('/api/sms/latest', methods=['GET'])
+def get_latest_sms():
+    """Get latest SMS messages"""
+    count = request.args.get('count', 10, type=int)
+    
+    with sms_lock:
+        sms_list = list(sms_storage)
+        # Get latest messages (last ones in the list)
+        latest = sms_list[-count:] if len(sms_list) > count else sms_list
+        # Reverse to show newest first
+        latest.reverse()
+        
+        return jsonify({
+            "status": "success",
+            "count": len(latest),
+            "data": latest
+        })
+
+
+@app.route('/api/sms/search', methods=['GET'])
+def search_sms():
+    """Search SMS messages by keyword"""
+    query = request.args.get('q', '')
+    if not query:
+        return jsonify({
+            "status": "error",
+            "message": "Missing 'q' parameter"
+        }), 400
+    
+    with sms_lock:
+        sms_list = list(sms_storage)
+        results = []
+        
+        for sms in sms_list:
+            # Search in sender, number, and message
+            if (query.lower() in sms[0].lower() or 
+                query.lower() in sms[1].lower() or 
+                query.lower() in sms[2].lower()):
+                results.append(sms)
+        
+        # Reverse to show newest first
+        results.reverse()
+        
+        return jsonify({
+            "status": "success",
+            "count": len(results),
+            "query": query,
+            "data": results
+        })
+
+
+@app.route('/api/sms/count', methods=['GET'])
+def get_count():
+    """Get total SMS count"""
+    with sms_lock:
+        return jsonify({
+            "status": "success",
+            "total_sms": len(sms_storage),
+            "seen_sms": len(seen_sms)
+        })
+
+
+@app.route('/api/sms/fetch', methods=['POST'])
+def fetch_now():
+    """Force fetch new SMS messages"""
     try:
-        while True:
-            try:
-                data = fetch_sms()
-                if data:
-                    parse_and_print_sms(data)
-                else:
-                    print("⏳ No new SMS data received")
-            except Exception as e:
-                print(f"❌ Error in main loop: {e}")
-            
-            # Save seen SMS periodically
-            save_seen_sms()
-            
-            # Wait 30 seconds before next check
-            time.sleep(30)
-    except KeyboardInterrupt:
-        print("\n👋 Shutting down gracefully...")
-        save_seen_sms()
-        print("💾 Saved seen SMS records")
+        data = fetch_sms()
+        if data:
+            new_records = parse_sms(data)
+            save_data()
+            return jsonify({
+                "status": "success",
+                "message": f"Fetched {len(new_records)} new SMS messages",
+                "new_messages": new_records
+            })
+        else:
+            return jsonify({
+                "status": "success",
+                "message": "No new messages found"
+            })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 
+# ============================================
+# MAIN
+# ============================================
 if __name__ == "__main__":
-    main()
+    # Load data from files
+    load_data()
+    
+    # Start background monitor thread
+    monitor_thread = threading.Thread(target=monitor_sms, daemon=True)
+    monitor_thread.start()
+    
+    # Get port from environment variable for Railway
+    port = int(os.environ.get("PORT", 5000))
+    
+    print(f"🚀 SMS Monitor API running on port {port}")
+    print("📊 API endpoints available at:")
+    print(f"   http://localhost:{port}/")
+    print(f"   http://localhost:{port}/api/sms")
+    print(f"   http://localhost:{port}/api/sms/latest")
+    print(f"   http://localhost:{port}/api/sms/search?q=keyword")
+    print(f"   http://localhost:{port}/health")
+    
+    # Run Flask app
+    app.run(host='0.0.0.0', port=port, debug=False)
