@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import json
 import threading
 from collections import deque
+import csv
+from io import StringIO
 
 app = Flask(__name__)
 
@@ -25,7 +27,7 @@ USER_AGENT = (
 
 session = requests.Session()
 
-# Store for SMS messages - simple array format
+# Store for SMS messages - Simple array format
 sms_storage = deque(maxlen=1000)  # Store last 1000 messages
 seen_sms = set()
 sms_lock = threading.Lock()
@@ -250,10 +252,59 @@ def fetch_sms():
 
 
 # ============================================
-# PARSE SMS - Simple array format
+# PARSE SMS - PROPER CSV PARSING
 # ============================================
 def parse_sms(data):
-    """Parse CSV data and return list of SMS messages in simple array format"""
+    """Parse CSV data and return list of SMS messages in simple array format [CLI, Number, SMS, Date]"""
+    if not data:
+        return []
+
+    new_records = []
+    
+    try:
+        # Parse CSV with proper quoting
+        csv_reader = csv.reader(StringIO(data))
+        
+        # Skip header
+        next(csv_reader, None)
+        
+        for row in csv_reader:
+            if len(row) >= 9:
+                # Columns based on CSV structure:
+                # 0: Date, 1: Range, 2: Number, 3: CLI, 4: Client, 5: SMS, 6: Currency, 7: My Payout, 8: Client Payout
+                date = row[0].strip()
+                cli = row[3].strip()  # CLI (Sender)
+                number = row[2].strip()  # Number
+                sms = row[5].strip()  # SMS (may contain newlines)
+                
+                # Clean up the SMS text - remove extra quotes if present
+                sms = sms.strip('"')
+                
+                # Create record in the format: [CLI, Number, SMS, Date]
+                record = [cli, number, sms, date]
+                
+                # Create unique identifier
+                sms_id = f"{date}_{cli}_{number}_{sms[:20]}"
+                
+                with sms_lock:
+                    if sms_id not in seen_sms:
+                        seen_sms.add(sms_id)
+                        sms_storage.append(record)
+                        new_records.append(record)
+                        
+    except Exception as e:
+        print(f"❌ Error parsing CSV: {e}")
+        # Fallback to manual parsing if CSV parser fails
+        return parse_sms_manual(data)
+    
+    return new_records
+
+
+# ============================================
+# PARSE SMS - MANUAL FALLBACK
+# ============================================
+def parse_sms_manual(data):
+    """Fallback manual parsing if CSV parser fails"""
     if not data:
         return []
 
@@ -262,41 +313,47 @@ def parse_sms(data):
         return []
 
     new_records = []
-
-    for line in lines:
-        if not line.strip():
+    
+    # Skip header
+    start_index = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith('"Date"') or line.strip().startswith('Date'):
+            start_index = i + 1
+            break
+    
+    for i in range(start_index, len(lines)):
+        line = lines[i].strip()
+        if not line:
             continue
-
-        if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},", line):
-            parts = line.split(',')
+        
+        # Simple split by comma (works for basic cases)
+        parts = line.split(',')
+        if len(parts) >= 6:
+            # Remove quotes
+            date = parts[0].strip('"')
+            cli = parts[3].strip('"') if len(parts) > 3 else ""
+            number = parts[2].strip('"') if len(parts) > 2 else ""
             
-            if len(parts) >= 6:
-                timestamp = parts[0].strip()
-                phone_number = parts[2].strip() if len(parts) > 2 else ""
-                sender = parts[3].strip() if len(parts) > 3 else ""
-                
-                # Build full message from columns 4 and 5
-                message = ""
-                if len(parts) > 4:
-                    message = parts[4].strip()
-                if len(parts) > 5 and parts[5].strip():
-                    if message:
-                        message += " " + parts[5].strip()
-                    else:
-                        message = parts[5].strip()
-                
-                # Create record in the format: [sender, phone_number, message, timestamp]
-                record = [sender, phone_number, message, timestamp]
-                
-                # Create unique identifier
-                sms_id = f"{timestamp}_{sender}_{phone_number}_{message[:20]}"
+            # Get SMS (might contain commas)
+            sms_parts = []
+            for j in range(5, len(parts)):
+                part = parts[j].strip('"')
+                if part and not part.startswith('$') and not part.replace('.', '').isdigit():
+                    sms_parts.append(part)
+                else:
+                    break
+            sms = ' '.join(sms_parts)
+            
+            if sms:
+                record = [cli, number, sms, date]
+                sms_id = f"{date}_{cli}_{number}_{sms[:20]}"
                 
                 with sms_lock:
                     if sms_id not in seen_sms:
                         seen_sms.add(sms_id)
                         sms_storage.append(record)
                         new_records.append(record)
-
+    
     return new_records
 
 
@@ -375,7 +432,6 @@ def get_all_sms():
         # Apply pagination
         paginated = sms_list[offset:offset+limit]
         
-        # Return only the array
         return jsonify(paginated)
 
 
@@ -391,7 +447,6 @@ def get_latest_sms():
         # Reverse to show newest first
         latest.reverse()
         
-        # Return only the array
         return jsonify(latest)
 
 
@@ -407,7 +462,7 @@ def search_sms():
         results = []
         
         for sms in sms_list:
-            # Search in sender (index 0), number (index 1), and message (index 2)
+            # Search in CLI (index 0), number (index 1), and SMS (index 2)
             if (query.lower() in sms[0].lower() or 
                 query.lower() in sms[1].lower() or 
                 query.lower() in sms[2].lower()):
@@ -416,7 +471,6 @@ def search_sms():
         # Reverse to show newest first
         results.reverse()
         
-        # Return only the array
         return jsonify(results)
 
 
@@ -438,7 +492,6 @@ def fetch_now():
         if data:
             new_records = parse_sms(data)
             save_data()
-            # Return only the new records array
             return jsonify(new_records)
         else:
             return jsonify([])
