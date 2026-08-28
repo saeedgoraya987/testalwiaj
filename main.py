@@ -25,7 +25,7 @@ USER_AGENT = (
 
 session = requests.Session()
 
-# Store for SMS messages
+# Store for SMS messages - simple array format
 sms_storage = deque(maxlen=1000)  # Store last 1000 messages
 seen_sms = set()
 sms_lock = threading.Lock()
@@ -250,10 +250,10 @@ def fetch_sms():
 
 
 # ============================================
-# PARSE SMS
+# PARSE SMS - Simple array format
 # ============================================
 def parse_sms(data):
-    """Parse CSV data and return list of SMS messages"""
+    """Parse CSV data and return list of SMS messages in simple array format"""
     if not data:
         return []
 
@@ -275,7 +275,7 @@ def parse_sms(data):
                 phone_number = parts[2].strip() if len(parts) > 2 else ""
                 sender = parts[3].strip() if len(parts) > 3 else ""
                 
-                # Build message from columns 4 and 5
+                # Build full message from columns 4 and 5
                 message = ""
                 if len(parts) > 4:
                     message = parts[4].strip()
@@ -352,17 +352,18 @@ def home():
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint for Railway"""
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "sms_count": len(sms_storage),
-        "seen_count": len(seen_sms)
-    })
+    with sms_lock:
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "sms_count": len(sms_storage),
+            "seen_count": len(seen_sms)
+        })
 
 
 @app.route('/api/sms', methods=['GET'])
 def get_all_sms():
-    """Get all SMS messages"""
+    """Get all SMS messages in simple array format"""
     limit = request.args.get('limit', 100, type=int)
     offset = request.args.get('offset', 0, type=int)
     
@@ -374,17 +375,13 @@ def get_all_sms():
         # Apply pagination
         paginated = sms_list[offset:offset+limit]
         
-        return jsonify({
-            "status": "success",
-            "count": len(paginated),
-            "total": len(sms_list),
-            "data": paginated
-        })
+        # Return only the array
+        return jsonify(paginated)
 
 
 @app.route('/api/sms/latest', methods=['GET'])
 def get_latest_sms():
-    """Get latest SMS messages"""
+    """Get latest SMS messages in simple array format"""
     count = request.args.get('count', 10, type=int)
     
     with sms_lock:
@@ -394,29 +391,23 @@ def get_latest_sms():
         # Reverse to show newest first
         latest.reverse()
         
-        return jsonify({
-            "status": "success",
-            "count": len(latest),
-            "data": latest
-        })
+        # Return only the array
+        return jsonify(latest)
 
 
 @app.route('/api/sms/search', methods=['GET'])
 def search_sms():
-    """Search SMS messages by keyword"""
+    """Search SMS messages by keyword in simple array format"""
     query = request.args.get('q', '')
     if not query:
-        return jsonify({
-            "status": "error",
-            "message": "Missing 'q' parameter"
-        }), 400
+        return jsonify([]), 400
     
     with sms_lock:
         sms_list = list(sms_storage)
         results = []
         
         for sms in sms_list:
-            # Search in sender, number, and message
+            # Search in sender (index 0), number (index 1), and message (index 2)
             if (query.lower() in sms[0].lower() or 
                 query.lower() in sms[1].lower() or 
                 query.lower() in sms[2].lower()):
@@ -425,12 +416,8 @@ def search_sms():
         # Reverse to show newest first
         results.reverse()
         
-        return jsonify({
-            "status": "success",
-            "count": len(results),
-            "query": query,
-            "data": results
-        })
+        # Return only the array
+        return jsonify(results)
 
 
 @app.route('/api/sms/count', methods=['GET'])
@@ -438,7 +425,6 @@ def get_count():
     """Get total SMS count"""
     with sms_lock:
         return jsonify({
-            "status": "success",
             "total_sms": len(sms_storage),
             "seen_sms": len(seen_sms)
         })
@@ -452,20 +438,13 @@ def fetch_now():
         if data:
             new_records = parse_sms(data)
             save_data()
-            return jsonify({
-                "status": "success",
-                "message": f"Fetched {len(new_records)} new SMS messages",
-                "new_messages": new_records
-            })
+            # Return only the new records array
+            return jsonify(new_records)
         else:
-            return jsonify({
-                "status": "success",
-                "message": "No new messages found"
-            })
+            return jsonify([])
     except Exception as e:
         return jsonify({
-            "status": "error",
-            "message": str(e)
+            "error": str(e)
         }), 500
 
 
