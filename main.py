@@ -1,91 +1,413 @@
-# main.py
-from fastapi import FastAPI, Query
-import httpx
-import hashlib
-from typing import Optional
+import requests
+import re
+import time
+import os
+from datetime import datetime, timedelta
+import json
 
-app = FastAPI()
+# ============================================
+# CREDENTIALS - Use environment variables
+# ============================================
+USERNAME = os.environ.get("TEMP_NUMBERS_USERNAME", "antallhayat")
+PASSWORD = os.environ.get("TEMP_NUMBERS_PASSWORD", "77889900")
 
-API_URL = "http://147.135.212.197/crapi/st/viewstats"
+BASE_URL = "http://tempnumbers.net"
 
-def generate_consistent_whatsapp_message(phone, original_message):
-    """
-    Generate consistent WhatsApp messages based on phone number
-    Same phone number always gets the same message
-    """
-    # Use phone number to generate consistent codes
-    hash_obj = hashlib.md5(phone.encode())
-    hash_hex = hash_obj.hexdigest()
-    
-    # Generate consistent 6-digit code
-    code_int = int(hash_hex[:8], 16) % 900 + 100
-    code = f"{code_int}-{code_int + 100}"
-    
-    # Generate consistent suffix (10 chars)
-    suffix_chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-    suffix = ''
-    for i in range(10):
-        idx = int(hash_hex[i:i+2], 16) % len(suffix_chars)
-        suffix += suffix_chars[idx]
-    
-    # Use phone number to deterministically pick a template
-    template_index = int(hash_hex[:4], 16) % 9
-    
-    messages = [
-        f"# Your WhatsApp code {code} Dont share this code with others {suffix}",
-        f"Your WhatsApp Business account is being registered on a new device\n\nDo not share this code with anyone\nYour WhatsApp Business code {code}",
-        f"كود واتساب للأعمال الخاص بك ‎{code.replace('-', '')} لا تشاركه مع أحد {suffix}",
-        f"# Kode WhatsApp {code} Jangan bagikan kode ini dengan orang lain {suffix}",
-        f"# Codigo de WhatsApp Business {code} No compartas este codigo con nadie {suffix}",
-        f"# Codigo de WhatsApp {code} No compartas este codigo con nadie {suffix}",
-        f"<#> Your WhatsApp account is being registered on a new device\n\nDo not share this code with anyone\nYour WhatsApp code: {code}\n{suffix}",
-        f"Your WhatsApp Business code {code}\nDont share this code with others",
-        f"كود واتساب للأعمال الخاص بك ‎{code.replace('-', '')}\nلا تشاركه مع أحد"
-    ]
-    
-    return messages[template_index]
+USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 10; K) "
+    "Chrome/130.0.0.0 Mobile Safari/537.36"
+)
 
-@app.get("/")
-async def root(token: Optional[str] = Query(None)):
+session = requests.Session()
+
+# Already printed records
+seen_sms = set()
+
+# For Railway, we'll use a simple file-based storage for seen_sms
+# to persist across restarts
+SEEN_FILE = "seen_sms.json"
+
+
+# ============================================
+# PERSIST SEEN SMS
+# ============================================
+def load_seen_sms():
+    """Load seen SMS from file"""
+    global seen_sms
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            if token:
-                response = await client.get(f"{API_URL}?token={token}")
-            else:
-                response = await client.get(API_URL)
-            
-            data = response.json()
-            
-            # Check if data is a list (successful response with messages)
-            if isinstance(data, list) and len(data) > 0:
-                processed_data = []
-                for item in data:
-                    if isinstance(item, list) and len(item) >= 4:
-                        service = item[0]
-                        phone = item[1]
-                        message = item[2]
-                        timestamp = item[3]
-                        
-                        # Replace WhatsApp ******* with consistent messages
-                        if service == "WhatsApp" and message == "*******":
-                            new_message = generate_consistent_whatsapp_message(phone, message)
-                            processed_data.append([service, phone, new_message, timestamp])
-                        else:
-                            processed_data.append([service, phone, message, timestamp])
-                    else:
-                        processed_data.append(item)
-                
-                return processed_data
-            else:
-                # Return original response (error, no records, etc.)
-                return data
-            
+        if os.path.exists(SEEN_FILE):
+            with open(SEEN_FILE, 'r') as f:
+                seen_sms = set(json.load(f))
+            print(f"📂 Loaded {len(seen_sms)} seen SMS records")
     except Exception as e:
-        return {
-            "status": "error",
-            "msg": str(e)
-        }
+        print(f"⚠️ Could not load seen SMS: {e}")
+        seen_sms = set()
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+
+def save_seen_sms():
+    """Save seen SMS to file"""
+    try:
+        with open(SEEN_FILE, 'w') as f:
+            json.dump(list(seen_sms), f)
+    except Exception as e:
+        print(f"⚠️ Could not save seen SMS: {e}")
+
+
+# ============================================
+# LOGIN
+# ============================================
+def login():
+    print(f"🔐 Logging in as {USERNAME}...")
+
+    try:
+        response = session.get(
+            f"{BASE_URL}/login",
+            headers={
+                "User-Agent": USER_AGENT
+            },
+            timeout=20
+        )
+
+        captcha_match = re.search(
+            r"What is (\d+) \+ (\d+) = ?",
+            response.text
+        )
+
+        if not captcha_match:
+            print("❌ Captcha not found")
+            return False
+
+        num1 = int(captcha_match.group(1))
+        num2 = int(captcha_match.group(2))
+        captcha_answer = num1 + num2
+
+        print(
+            f"🧩 Captcha: "
+            f"{num1} + {num2} = {captcha_answer}"
+        )
+
+        login_response = session.post(
+            f"{BASE_URL}/signin",
+            data={
+                "username": USERNAME,
+                "password": PASSWORD,
+                "capt": captcha_answer,
+                "remember-me": "on"
+            },
+            headers={
+                "User-Agent": USER_AGENT,
+                "Referer": f"{BASE_URL}/login"
+            },
+            allow_redirects=True,
+            timeout=20
+        )
+
+        if "x12" in session.cookies:
+            print("✅ Login successful")
+            return True
+
+        print("❌ Login failed")
+        return False
+
+    except requests.RequestException as e:
+        print(f"❌ Login error: {e}")
+        return False
+
+
+# ============================================
+# SESSION CHECK
+# ============================================
+def session_is_valid():
+
+    if "x12" not in session.cookies:
+        return False
+
+    try:
+        response = session.get(
+            f"{BASE_URL}/agent/SMSCDRReports",
+            headers={
+                "User-Agent": USER_AGENT
+            },
+            timeout=20,
+            allow_redirects=True
+        )
+
+        if "/login" in response.url.lower():
+            return False
+
+        if (
+            "signin" in response.text.lower()
+            and "username" in response.text.lower()
+        ):
+            return False
+
+        return response.status_code == 200
+
+    except requests.RequestException:
+        return False
+
+
+# ============================================
+# ENSURE LOGIN
+# ============================================
+def ensure_login():
+
+    if session_is_valid():
+        return True
+
+    print("⚠️ Session expired")
+    print("🔄 Logging in again...")
+
+    session.cookies.clear()
+
+    for attempt in range(1, 4):
+
+        if login():
+            return True
+
+        print(
+            f"❌ Login attempt "
+            f"{attempt}/3 failed"
+        )
+
+        if attempt < 3:
+            time.sleep(5)
+
+    return False
+
+
+# ============================================
+# FETCH CSV
+# ============================================
+def fetch_sms():
+
+    if not ensure_login():
+        return None
+
+    start_date = datetime.now().strftime("%Y-%m-%d")
+
+    end_date = (
+        datetime.now() + timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    try:
+
+        response = session.post(
+            f"{BASE_URL}/agent/res/exportsmscdr",
+            data={
+                "fdate1": start_date,
+                "fdate2": end_date,
+                "frange": "",
+                "fclient": "",
+                "fnum": "",
+                "fcli": ""
+            },
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Content-Type":
+                    "application/x-www-form-urlencoded",
+                "Referer":
+                    f"{BASE_URL}/agent/SMSCDRReports",
+                "User-Agent": USER_AGENT
+            },
+            timeout=20
+        )
+
+        # ========================================
+        # SESSION EXPIRED
+        # ========================================
+        if (
+            response.status_code in (401, 403)
+            or "/login" in response.url.lower()
+            or (
+                "signin" in response.text.lower()
+                and "username" in response.text.lower()
+            )
+        ):
+
+            print("⚠️ Session expired")
+            print("🔄 Re-logging in...")
+
+            session.cookies.clear()
+
+            if not login():
+                return None
+
+            print("🔁 Retrying SMS request...")
+
+            response = session.post(
+                f"{BASE_URL}/agent/res/exportsmscdr",
+                data={
+                    "fdate1": start_date,
+                    "fdate2": end_date,
+                    "frange": "",
+                    "fclient": "",
+                    "fnum": "",
+                    "fcli": ""
+                },
+                headers={
+                    "X-Requested-With":
+                        "XMLHttpRequest",
+                    "Content-Type":
+                        "application/x-www-form-urlencoded",
+                    "Referer":
+                        f"{BASE_URL}/agent/SMSCDRReports",
+                    "User-Agent": USER_AGENT
+                },
+                timeout=20
+            )
+
+        if (
+            response.status_code == 200
+            and "html" not in response.text.lower()
+        ):
+            return response.text
+
+        print(
+            f"❌ Request failed: "
+            f"{response.status_code}"
+        )
+
+        return None
+
+    except requests.RequestException as e:
+        print(f"❌ Request error: {e}")
+        return None
+
+
+# ============================================
+# PARSE AND PRINT SMS IN REQUIRED FORMAT
+# ============================================
+def parse_and_print_sms(data):
+    """
+    Parse CSV data and print SMS in the format:
+    [
+      ["Google", "22220197732", "G-540150 est votre code de validation Google", "2026-08-28 03:35:17"]
+    ]
+    """
+    if not data:
+        return
+
+    lines = data.splitlines()
+    if not lines:
+        return
+
+    # Track new SMS records
+    new_records = []
+
+    for line in lines:
+        # Skip empty lines
+        if not line.strip():
+            continue
+
+        # Check if this is a valid CSV line with timestamp
+        if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},", line):
+            # Parse the CSV line
+            parts = line.split(',')
+            
+            # We expect at least 4 columns
+            if len(parts) >= 4:
+                # Extract data
+                # Column order might vary, but typically:
+                # timestamp, sender, number, message, etc.
+                timestamp = parts[0].strip()
+                
+                # Try to find sender (could be in different positions)
+                # Based on your format, sender might be in column 1 or 2
+                sender = ""
+                message = ""
+                number = ""
+                
+                # This is a simplified parsing - adjust based on actual CSV structure
+                for i, part in enumerate(parts):
+                    part = part.strip()
+                    # Look for sender
+                    if not sender and part and not part.startswith('+') and not re.match(r'^\d{4}-\d{2}-\d{2}', part):
+                        sender = part
+                    # Look for message
+                    if not message and part and len(part) > 10 and not part.startswith('+'):
+                        message = part
+                    # Look for number
+                    if not number and part and part.startswith('+'):
+                        number = part
+                    # If we have sender, number, and message, break
+                    if sender and number and message:
+                        break
+                
+                # If we didn't find them, use fallback positions
+                if not sender and len(parts) > 1:
+                    sender = parts[1].strip() if parts[1].strip() else "Unknown"
+                if not number and len(parts) > 2:
+                    # Try to find a number format
+                    for part in parts[2:]:
+                        if re.search(r'\+?\d{8,15}', part):
+                            number = part.strip()
+                            break
+                    if not number:
+                        number = parts[2].strip() if len(parts) > 2 else ""
+                if not message and len(parts) > 3:
+                    message = parts[3].strip() if len(parts) > 3 else ""
+                
+                # Create record in the format: [sender, number, message, timestamp]
+                # Your format: ["Google", "22220197732", "G-540150 est votre code de validation Google", "2026-08-28 03:35:17"]
+                record = [sender, number, message, timestamp]
+                
+                # Create a unique identifier for this SMS
+                sms_id = f"{timestamp}_{sender}_{number}_{message[:20]}"
+                
+                # Check if we've seen this SMS before
+                if sms_id not in seen_sms:
+                    seen_sms.add(sms_id)
+                    new_records.append(record)
+                    
+                    # Print in the required format
+                    print("\n📩 NEW SMS:")
+                    print(json.dumps([record], indent=2, ensure_ascii=False))
+                    
+                    # Save seen SMS periodically
+                    save_seen_sms()
+
+    return new_records
+
+
+# ============================================
+# MAIN
+# ============================================
+def main():
+    # Load previously seen SMS
+    load_seen_sms()
+    
+    # Initial login
+    if not login():
+        print("❌ Initial login failed")
+        return
+
+    print("🚀 SMS monitor started")
+    print(f"📊 Monitoring on Railway - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("⏱️ Checking every 30 seconds\n")
+
+    # For Railway, we should handle graceful shutdown
+    try:
+        while True:
+            try:
+                data = fetch_sms()
+                if data:
+                    parse_and_print_sms(data)
+                else:
+                    print("⏳ No new SMS data received")
+            except Exception as e:
+                print(f"❌ Error in main loop: {e}")
+            
+            # Save seen SMS periodically
+            save_seen_sms()
+            
+            # Wait 30 seconds before next check
+            time.sleep(30)
+    except KeyboardInterrupt:
+        print("\n👋 Shutting down gracefully...")
+        save_seen_sms()
+        print("💾 Saved seen SMS records")
+
+
+if __name__ == "__main__":
+    main()
