@@ -345,12 +345,23 @@ def health():
     })
 
 
+def record_to_dict(record: list[str]) -> dict[str, str]:
+    """Convert a positional SMS record into the public JSON response shape."""
+    return dict(zip(OUTPUT_HEADER, record))
+
+
+def latest_record_dicts(records: list[list[str]]) -> list[dict[str, str]]:
+    """Return at most the 10 most recent records, newest record first."""
+    return [record_to_dict(record) for record in records[-10:][::-1]]
+
+
 @app.get("/sms")
 def sms():
     fresh = request.args.get("fresh", "false").lower() in {"1", "true", "yes"}
     if fresh:
         log_new_records(poll_once())
-    return jsonify({"columns": OUTPUT_HEADER, "records": latest_records, "count": len(latest_records), "last_poll_at": last_poll_at})
+    records = latest_record_dicts(latest_records)
+    return jsonify({"count": len(records), "last_poll_at": last_poll_at, "records": records})
 
 
 @app.post("/poll")
@@ -359,7 +370,8 @@ def poll():
     log_new_records(records)
     if last_error:
         return jsonify({"error": last_error, "records": [], "count": 0}), 502
-    return jsonify({"columns": OUTPUT_HEADER, "records": records, "count": len(records), "last_poll_at": last_poll_at})
+    records = latest_record_dicts(records)
+    return jsonify({"count": len(records), "last_poll_at": last_poll_at, "records": records})
 
 
 logger.info("API starting: base_url=%s poll_interval=%s request_timeout=%s", BASE_URL, POLL_INTERVAL, REQUEST_TIMEOUT)
