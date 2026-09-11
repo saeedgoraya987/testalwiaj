@@ -139,6 +139,7 @@ def login() -> bool:
     if not USERNAME or not PASSWORD:
         raise RuntimeError("TEMP_NUMBERS_USERNAME and TEMP_NUMBERS_PASSWORD are required")
 
+    logger.info("ðŸ” Logging in as %s...", USERNAME)
     logger.info("Starting upstream login: base_url=%s username_configured=%s", BASE_URL, bool(USERNAME))
     response = session.get(
         f"{BASE_URL}/login",
@@ -148,10 +149,12 @@ def login() -> bool:
     response.raise_for_status()
     captcha_match = re.search(r"What is (\d+) \+ (\d+) = ?", response.text)
     if not captcha_match:
+        logger.error("âŒ Captcha not found")
         logger.error("Upstream login failed: arithmetic challenge was not found (status=%s)", response.status_code)
         return False
 
     answer = int(captcha_match.group(1)) + int(captcha_match.group(2))
+    logger.info("ðŸ§© Captcha: %s + %s = %s", captcha_match.group(1), captcha_match.group(2), answer)
     login_response = session.post(
         f"{BASE_URL}/signin",
         data={"username": USERNAME, "password": PASSWORD, "capt": answer, "remember-me": "on"},
@@ -160,6 +163,10 @@ def login() -> bool:
         timeout=REQUEST_TIMEOUT,
     )
     success = login_response.ok and "x12" in session.cookies
+    if success:
+        logger.info("âœ… Login successful")
+    else:
+        logger.error("âŒ Login failed")
     logger.info("Upstream login finished: success=%s status=%s cookie_present=%s", success, login_response.status_code, "x12" in session.cookies)
     return success
 
@@ -184,6 +191,8 @@ def ensure_login() -> bool:
     if session_is_valid():
         logger.debug("Existing upstream session is valid")
         return True
+    logger.warning("âš ï¸ Session expired")
+    logger.info("ðŸ”„ Logging in again...")
     logger.info("Upstream session missing or expired; attempting login")
     session.cookies.clear()
     for attempt in range(3):
@@ -191,11 +200,13 @@ def ensure_login() -> bool:
             if login():
                 return True
         except requests.RequestException as exc:
+            logger.error("âŒ Login error: %s", exc)
             logger.warning("Login attempt %s/3 request error: %s", attempt + 1, exc)
         except RuntimeError as exc:
             logger.error("Login configuration error: %s", exc)
             return False
         if attempt < 2:
+            logger.error("âŒ Login attempt %s/3 failed", attempt + 1)
             time.sleep(1)
     logger.error("All upstream login attempts failed")
     return False
@@ -226,11 +237,15 @@ def fetch_sms() -> str | None:
         )
         logger.info("SMS export request finished: status=%s bytes=%s url=%s", response.status_code, len(response.content), response.url)
         if response.status_code in (401, 403) or "/login" in response.url.lower():
+            logger.warning("âš ï¸ Session expired")
+            logger.info("ðŸ”„ Re-logging in...")
             logger.warning("SMS export indicates an expired session; re-authenticating")
             session.cookies.clear()
             if not login():
+                logger.error("âŒ Request failed after re-login")
                 logger.error("Re-authentication failed during SMS export retry")
                 return None
+            logger.info("ðŸ” Retrying SMS request...")
             response = session.post(
                 f"{BASE_URL}/agent/res/exportsmscdr",
                 data=payload,
@@ -241,6 +256,7 @@ def fetch_sms() -> str | None:
         text = response.text.strip()
         if response.ok and text and "<html" not in text.lower() and "<!doctype" not in text.lower():
             return text
+        logger.error("âŒ Request failed: %s", response.status_code)
         logger.error("SMS export returned unusable response: status=%s content_type=%s", response.status_code, response.headers.get("Content-Type"))
         return None
 
@@ -267,14 +283,28 @@ def poll_once() -> list[list[str]]:
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         last_error = str(exc)
         last_poll_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        logger.error("âŒ Error: %s", exc)
         logger.exception("Poll failed: %s", exc)
         return []
 
 
+def log_new_records(records: list[list[str]]) -> None:
+    for record in records:
+        output = io.StringIO()
+        csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="").writerow(OUTPUT_HEADER)
+        logger.info("\nðŸ“© NEW SMS\n%s", output.getvalue())
+        output = io.StringIO()
+        csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="").writerow(record)
+        logger.info("%s", output.getvalue())
+
+
 def background_poller() -> None:
+    logger.info("ðŸš€ SMS monitor started")
+    logger.info("â±ï¸ Checking every %s seconds", POLL_INTERVAL)
     logger.info("Background poller started: interval_seconds=%s", POLL_INTERVAL)
     while True:
-        poll_once()
+        new_records = poll_once()
+        log_new_records(new_records)
         time.sleep(POLL_INTERVAL)
 
 
@@ -319,13 +349,14 @@ def health():
 def sms():
     fresh = request.args.get("fresh", "false").lower() in {"1", "true", "yes"}
     if fresh:
-        poll_once()
+        log_new_records(poll_once())
     return jsonify({"columns": OUTPUT_HEADER, "records": latest_records, "count": len(latest_records), "last_poll_at": last_poll_at})
 
 
 @app.post("/poll")
 def poll():
     records = poll_once()
+    log_new_records(records)
     if last_error:
         return jsonify({"error": last_error, "records": [], "count": 0}), 502
     return jsonify({"columns": OUTPUT_HEADER, "records": records, "count": len(records), "last_poll_at": last_poll_at})
