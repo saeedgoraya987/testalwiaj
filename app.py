@@ -1,5 +1,6 @@
 import csv
 import io
+import logging
 import os
 import re
 import threading
@@ -10,6 +11,12 @@ from typing import Any
 import requests
 from flask import Flask, jsonify, request
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    force=True,
+)
+logger = logging.getLogger("sms-api")
 app = Flask(__name__)
 
 BASE_URL = os.getenv("BASE_URL", "http://tempnumbers.net").rstrip("/")
@@ -132,6 +139,7 @@ def login() -> bool:
     if not USERNAME or not PASSWORD:
         raise RuntimeError("TEMP_NUMBERS_USERNAME and TEMP_NUMBERS_PASSWORD are required")
 
+    logger.info("Starting upstream login: base_url=%s username_configured=%s", BASE_URL, bool(USERNAME))
     response = session.get(
         f"{BASE_URL}/login",
         headers={"User-Agent": USER_AGENT},
@@ -140,6 +148,7 @@ def login() -> bool:
     response.raise_for_status()
     captcha_match = re.search(r"What is (\d+) \+ (\d+) = ?", response.text)
     if not captcha_match:
+        logger.error("Upstream login failed: arithmetic challenge was not found (status=%s)", response.status_code)
         return False
 
     answer = int(captcha_match.group(1)) + int(captcha_match.group(2))
@@ -150,7 +159,9 @@ def login() -> bool:
         allow_redirects=True,
         timeout=REQUEST_TIMEOUT,
     )
-    return login_response.ok and "x12" in session.cookies
+    success = login_response.ok and "x12" in session.cookies
+    logger.info("Upstream login finished: success=%s status=%s cookie_present=%s", success, login_response.status_code, "x12" in session.cookies)
+    return success
 
 
 def session_is_valid() -> bool:
@@ -171,22 +182,29 @@ def session_is_valid() -> bool:
 
 def ensure_login() -> bool:
     if session_is_valid():
+        logger.debug("Existing upstream session is valid")
         return True
+    logger.info("Upstream session missing or expired; attempting login")
     session.cookies.clear()
     for attempt in range(3):
         try:
             if login():
                 return True
-        except requests.RequestException:
-            pass
+        except requests.RequestException as exc:
+            logger.warning("Login attempt %s/3 request error: %s", attempt + 1, exc)
+        except RuntimeError as exc:
+            logger.error("Login configuration error: %s", exc)
+            return False
         if attempt < 2:
             time.sleep(1)
+    logger.error("All upstream login attempts failed")
     return False
 
 
 def fetch_sms() -> str | None:
     with session_lock:
         if not ensure_login():
+            logger.error("SMS fetch skipped because upstream login failed")
             return None
         start_date = datetime.now().strftime("%Y-%m-%d")
         end_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -206,9 +224,12 @@ def fetch_sms() -> str | None:
             headers=headers,
             timeout=REQUEST_TIMEOUT,
         )
+        logger.info("SMS export request finished: status=%s bytes=%s url=%s", response.status_code, len(response.content), response.url)
         if response.status_code in (401, 403) or "/login" in response.url.lower():
+            logger.warning("SMS export indicates an expired session; re-authenticating")
             session.cookies.clear()
             if not login():
+                logger.error("Re-authentication failed during SMS export retry")
                 return None
             response = session.post(
                 f"{BASE_URL}/agent/res/exportsmscdr",
@@ -216,14 +237,17 @@ def fetch_sms() -> str | None:
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
             )
+            logger.info("SMS export retry finished: status=%s bytes=%s", response.status_code, len(response.content))
         text = response.text.strip()
         if response.ok and text and "<html" not in text.lower() and "<!doctype" not in text.lower():
             return text
+        logger.error("SMS export returned unusable response: status=%s content_type=%s", response.status_code, response.headers.get("Content-Type"))
         return None
 
 
 def poll_once() -> list[list[str]]:
     global latest_records, last_poll_at, last_error
+    logger.info("Poll started")
     try:
         data = fetch_sms()
         if data is None:
@@ -238,14 +262,17 @@ def poll_once() -> list[list[str]]:
         latest_records = records
         last_error = None
         last_poll_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        logger.info("Poll completed: records=%s new_records=%s", len(records), len(new_records))
         return new_records
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         last_error = str(exc)
         last_poll_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        logger.exception("Poll failed: %s", exc)
         return []
 
 
 def background_poller() -> None:
+    logger.info("Background poller started: interval_seconds=%s", POLL_INTERVAL)
     while True:
         poll_once()
         time.sleep(POLL_INTERVAL)
@@ -254,9 +281,23 @@ def background_poller() -> None:
 def start_background_poller() -> None:
     global poller_started
     if os.getenv("ENABLE_POLLER", "false").lower() not in {"1", "true", "yes"} or poller_started:
+        logger.info("Background poller disabled")
         return
     poller_started = True
     threading.Thread(target=background_poller, name="sms-poller", daemon=True).start()
+
+
+@app.before_request
+def log_request_start():
+    request._started_at = time.monotonic()
+    logger.info("Request started: method=%s path=%s", request.method, request.path)
+
+
+@app.after_request
+def log_request_end(response):
+    elapsed_ms = (time.monotonic() - getattr(request, "_started_at", time.monotonic())) * 1000
+    logger.info("Request finished: method=%s path=%s status=%s duration_ms=%.1f", request.method, request.path, response.status_code, elapsed_ms)
+    return response
 
 
 @app.get("/")
@@ -290,6 +331,7 @@ def poll():
     return jsonify({"columns": OUTPUT_HEADER, "records": records, "count": len(records), "last_poll_at": last_poll_at})
 
 
+logger.info("API starting: base_url=%s poll_interval=%s request_timeout=%s", BASE_URL, POLL_INTERVAL, REQUEST_TIMEOUT)
 start_background_poller()
 
 if __name__ == "__main__":
